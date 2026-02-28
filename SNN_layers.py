@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Inital commit
+
 """
 # File Name : snn_layers.py
 # Author: Haowen Fang
