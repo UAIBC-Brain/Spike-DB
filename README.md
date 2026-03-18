@@ -15,6 +15,7 @@ Install this project using pip:
 pip install snntorch
 ```
 
+
 ### Reference
 - [1][Paper](https://proceedings.neurips.cc/paper_files/paper/2024/file/9c3828adf1500f5de3c56f6550dfe43c-Paper-Conference.pdf)
 
