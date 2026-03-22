@@ -1,6 +1,6 @@
 # <div align = center>Spike-based-Digital-Brain</div>
 
-**A novel fundamental model for brain activity analysis.**
+**We are actively building this repository. Stay tuned!**
 
 ### Data availability statement
 The data is not publicly available due to permission reasons. The data are available from the corresponding author on reasonable request.
