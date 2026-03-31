@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 import numpy as np
 import scipy.io as sio
 import torch
@@ -7,6 +9,45 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelSummary
 from x_transformers import Encoder
+from SNN_fMRI import SNN_Model
+
+try:
+    import importlib.metadata  # type: ignore
+except ModuleNotFoundError:
+    import importlib_metadata
+
+    sys.modules["importlib.metadata"] = importlib_metadata
+
+
+class _StatelessSurrogateLeaky(nn.Module):
+    def __init__(self, beta=0.9, threshold=0.5, slope=10.0):
+        super().__init__()
+        self.beta = beta
+        self.threshold = threshold
+        self.slope = slope
+
+    def forward(self, x, mem=None):
+        if mem is None:
+            mem = torch.zeros_like(x)
+
+        mem = self.beta * mem + x
+        surrogate = torch.sigmoid(self.slope * (mem - self.threshold))
+        hard_spike = (mem >= self.threshold).float()
+        spike = hard_spike.detach() - surrogate.detach() + surrogate
+        reset_mem = mem * (1.0 - hard_spike.detach())
+        return spike, reset_mem
+
+
+try:
+    import snntorch as snn
+except ModuleNotFoundError:
+    fallback_snntorch = types.ModuleType("snntorch")
+    fallback_snntorch.Leaky = _StatelessSurrogateLeaky
+    sys.modules.setdefault("snntorch", fallback_snntorch)
+    import snntorch as snn
+
+
+BETA = 0.9
 
 def compute_sen_spe(preds, labels):
     TP = ((preds == 1) & (labels == 1)).sum().item()
@@ -28,14 +69,18 @@ class IJEPA_fMRI_classifier(nn.Module):
         self.token_embed = nn.Linear(seq_len, embed_dim)
         self.pos_embedding = nn.Parameter(torch.randn(1, num_regions, embed_dim))
         self.post_emb_norm = nn.LayerNorm(embed_dim)
+        self.token_lif = snn.Leaky(beta=BETA)
 
         self.encoder = Encoder(dim=embed_dim, heads=num_heads, depth=enc_depth, layer_dropout=0.0)
+        self.encoder_lif = snn.Leaky(beta=BETA)
 
         self.head_norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, num_classes)
-        )
+        self.pool_lif = snn.Leaky(beta=BETA)
+        self.hidden = nn.Linear(embed_dim, embed_dim)
+        self.hidden_lif = snn.Leaky(beta=BETA)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(embed_dim, num_classes)
+        self.classifier_lif = snn.Leaky(beta=BETA)
 
     def forward(self, x):
         """
@@ -43,10 +88,17 @@ class IJEPA_fMRI_classifier(nn.Module):
         """
         x = self.token_embed(x) + self.pos_embedding     # [B, R, D]
         x = self.post_emb_norm(x)                        # [B, R, D]
+        x, _ = self.token_lif(x)
         x = self.encoder(x)                              # [B, R, D]
+        x, _ = self.encoder_lif(x)
         x = self.head_norm(x)                            # [B, R, D]  <-- LN 
         x = x.mean(dim=1)                                # [B, D]
+        x, _ = self.pool_lif(x)
+        x = self.hidden(x)
+        x, _ = self.hidden_lif(x)
+        x = self.dropout(x)
         logits = self.head(x)                            # [B, num_classes]
+        logits, _ = self.classifier_lif(logits)
         return logits
 
 class IJEPA_fMRI_Lit(pl.LightningModule):
@@ -104,7 +156,7 @@ class IJEPA_fMRI_Lit(pl.LightningModule):
 
 
 class FMRI_Classification_Dataset(Dataset):
-    def __init__(self, data_path, label_path, zscore=False):
+    def __init__(self, data_path, label_path, zscore=False, spike_model=None, device="cpu"):
         mat_data = sio.loadmat(data_path)
         mat_label = sio.loadmat(label_path)
 
@@ -120,7 +172,7 @@ class FMRI_Classification_Dataset(Dataset):
         if y.min() == 1 and y.max() == 2:
             y = y - 1
 
-        assert len(X) == len(y), f"数据和标签数量不匹配: X={len(X)}, y={len(y)}"
+        assert len(X) == len(y), f"The number of data and tags does not match: X={len(X)}, y={len(y)}"
 
         if zscore:
             mean = X.mean(axis=2, keepdims=True)
@@ -129,17 +181,28 @@ class FMRI_Classification_Dataset(Dataset):
 
         self.X = X
         self.y = y
+        self.spike = spike_model
+        self.device = device
+
+        if self.spike is not None:
+            self.spike = self.spike.to(self.device)
+            self.spike.eval()
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        x = torch.from_numpy(self.X[idx])           # [R, T]
+        x = torch.from_numpy(self.X[idx]).float()   # [R, T]
+        x = x.unsqueeze(0).to(self.device)
+        if self.spike is not None:
+            with torch.no_grad():
+                x = self.spike(x)
+        x = x.squeeze(0).cpu()
         y = torch.tensor(self.y[idx], dtype=torch.long)
         return x, y
 
 class FMRIDataModule(pl.LightningDataModule):
-    def __init__(self, data_path, label_path, batch_size=8, num_workers=2, shuffle=True, zscore=False):
+    def __init__(self, data_path, label_path, batch_size=8, num_workers=2, shuffle=True, zscore=False, device="cpu"):
         super().__init__()
         self.data_path = data_path
         self.label_path = label_path
@@ -147,9 +210,17 @@ class FMRIDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.shuffle = shuffle
         self.zscore = zscore
+        self.device = device
 
     def setup(self, stage=None):
-        full_dataset = FMRI_Classification_Dataset(self.data_path, self.label_path, zscore=self.zscore)
+        snn_model = SNN_Model()
+        full_dataset = FMRI_Classification_Dataset(
+            self.data_path,
+            self.label_path,
+            zscore=self.zscore,
+            spike_model=snn_model,
+            device=self.device,
+        )
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
         self.train_dataset, self.val_dataset = random_split(full_dataset, [train_size, val_size])
@@ -165,7 +236,8 @@ if __name__ == "__main__":
     data_path = r"G:\XXX\XXX.mat"
     label_path = r"G:\XXX\XXX.mat"
 
-    dm = FMRIDataModule(data_path, label_path, batch_size=2, num_workers=2, shuffle=True, zscore=False)
+    runtime_device = "cuda" if torch.cuda.is_available() else "cpu"
+    dm = FMRIDataModule(data_path, label_path, batch_size=2, num_workers=2, shuffle=True, zscore=False, device=runtime_device)
 
     model = IJEPA_fMRI_Lit(dataset_path=data_path,
                            label_path=label_path,
