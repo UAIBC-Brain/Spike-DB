@@ -1,28 +1,31 @@
-import torch
-import scipy.io as sio
-import numpy as np
 import os
-from SpikeDB import IJEPA_fMRI   
+
+import numpy as np
+import scipy.io as sio
+import torch
+
+from SpikeDB import IJEPA_fMRI
+
 
 ckpt_path = r"G:\XXX\XXX.ckpt"
 data_path = r"G:\XXX\XXX.mat"
-sample_idx = 50          
-exclude_self = True       
+sample_idx = 50
+exclude_self = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-perturbation_method = "gaussian_bump"   
+perturbation_method = "gaussian_bump"
 perturb_params = {
     "add_constant": dict(k_std=0.5, value=None),
     "scale": dict(alpha=0.5),
     "impulse": dict(t0=80, t1=120, k_std=1.0, value=None),
-    "gaussian_bump": dict(tc=95, sigma=20, k_std=1.0, value=None),   
+    "gaussian_bump": dict(tc=95, sigma=20, k_std=1.0, value=None),
     "sinusoid": dict(freq=2.0, phi=0.0, k_std=1.0, value=None),
     "noise": dict(k_std=0.5),
     "silence": dict(mode="mean"),
 }
 
 scale_factor = 10000.0
-threshold = 0.001   
+threshold = 0.001
 
 mat = sio.loadmat(data_path)
 
@@ -30,21 +33,35 @@ if "Data" in mat:
     Data = mat["Data"]
 else:
     Data = None
-    for k, v in mat.items():
-        if isinstance(v, np.ndarray) and v.ndim == 3:
-            Data = v
+    for _, value in mat.items():
+        if isinstance(value, np.ndarray) and value.ndim == 3:
+            Data = value
             break
     if Data is None:
-        raise KeyError(f"无法在 {data_path} 中找到变量 'Data' 或其他三维数组。")
+        raise KeyError(f"Could not find 'Data' or any other 3D array in {data_path}.")
 
 Data = Data.astype(np.float32)  # [num_samples, num_regions, seq_len]
 num_samples, num_regions, seq_len = Data.shape
 
 if not (0 <= sample_idx < num_samples):
-    raise ValueError(f"样本索引超出范围: 0 <= sample_idx < {num_samples}")
+    raise ValueError(f"Sample index out of range: 0 <= sample_idx < {num_samples}")
 
-x_orig = Data[sample_idx]                   # [R, T]
+x_orig = Data[sample_idx]  # [R, T]
 x_tensor = torch.from_numpy(x_orig).unsqueeze(0).to(device)  # [1, R, T]
+
+
+def extract_prediction_sequence(model_output):
+    if isinstance(model_output, dict):
+        if "pred_seq" in model_output:
+            return model_output["pred_seq"]
+        if "target_seq" in model_output:
+            return model_output["target_seq"]
+        raise KeyError("Model output dict does not contain 'pred_seq' or 'target_seq'.")
+
+    if isinstance(model_output, (tuple, list)):
+        return model_output[0]
+
+    return model_output
 
 
 try:
@@ -56,10 +73,7 @@ model.eval().to(device)
 
 with torch.no_grad():
     out = model(x_tensor)
-    if isinstance(out, (tuple, list)):
-        pred_orig = out[0]
-    else:
-        pred_orig = out
+    pred_orig = extract_prediction_sequence(out)
 pred_orig = pred_orig.squeeze(0).cpu().numpy()  # [R, T]
 
 
@@ -88,7 +102,7 @@ def apply_perturbation(x_batch, src_region, method, params, seq_len):
         t0 = int(cfg.get("t0", 0))
         t1 = int(cfg.get("t1", min(30, seq_len)))
         t0 = max(0, min(t0, seq_len))
-        t1 = max(t0+1, min(t1, seq_len))
+        t1 = max(t0 + 1, min(t1, seq_len))
         amp = _resolve_amp(k_std=cfg.get("k_std", 1.0), value=cfg.get("value", None))
         mask = torch.zeros_like(x_src)
         mask[t0:t1] = 1.0
@@ -96,12 +110,12 @@ def apply_perturbation(x_batch, src_region, method, params, seq_len):
 
     elif method == "gaussian_bump":
         cfg = params.get("gaussian_bump", {})
-        tc = float(cfg.get("tc", seq_len/2))
+        tc = float(cfg.get("tc", seq_len / 2))
         sigma = float(cfg.get("sigma", 20.0))
         amp = _resolve_amp(k_std=cfg.get("k_std", 1.0), value=cfg.get("value", None))
         t = torch.arange(seq_len, device=x_src.device, dtype=x_src.dtype)
-        bump = torch.exp(-0.5 * ((t - tc) / max(1e-6, sigma))**2)
-        bump = bump / (bump.max().clamp(min=1e-12))
+        bump = torch.exp(-0.5 * ((t - tc) / max(1e-6, sigma)) ** 2)
+        bump = bump / bump.max().clamp(min=1e-12)
         x_src = x_src + amp * bump
 
     elif method == "sinusoid":
@@ -128,7 +142,7 @@ def apply_perturbation(x_batch, src_region, method, params, seq_len):
             x_src = torch.ones_like(x_src) * src_mean
 
     else:
-        raise ValueError(f"未知扰动方法: {method}")
+        raise ValueError(f"Unknown perturbation method: {method}")
 
     x_p[0, src_region, :] = x_src
     return x_p
@@ -137,20 +151,20 @@ def apply_perturbation(x_batch, src_region, method, params, seq_len):
 EC_matrix = np.zeros((num_regions, num_regions), dtype=np.float64)
 per_source_best = []  # (src, best_tgt, best_signed_val, pos_idx, pos_val, neg_idx, neg_val)
 
-print("\n开始扰动并计算（差异已乘以 {}，阈值 = {}）...\n".format(int(scale_factor), threshold))
+print(
+    "\nStarting perturbation analysis "
+    f"(difference scaled by {int(scale_factor)}, threshold = {threshold})...\n"
+)
 
 for src_region in range(num_regions):
     x_perturbed = apply_perturbation(x_tensor, src_region, perturbation_method, perturb_params, seq_len)
     with torch.no_grad():
         out_new = model(x_perturbed)
-        if isinstance(out_new, (tuple, list)):
-            pred_new = out_new[0]
-        else:
-            pred_new = out_new
+        pred_new = extract_prediction_sequence(out_new)
     pred_new = pred_new.squeeze(0).cpu().numpy()  # [R, T]
 
-    delta = pred_new - pred_orig                   # [R, T]
-    delta_mean = delta.mean(axis=1) * scale_factor # [R]
+    delta = pred_new - pred_orig  # [R, T]
+    delta_mean = delta.mean(axis=1) * scale_factor  # [R]
 
     if exclude_self:
         delta_mean[src_region] = 0.0
@@ -160,15 +174,19 @@ for src_region in range(num_regions):
     abs_idx = int(np.argmax(np.abs(delta_mean)))
     abs_signed_val = float(delta_mean[abs_idx])
 
-    pos_vals = delta_mean.copy(); pos_vals[pos_vals <= 0] = -np.inf
+    pos_vals = delta_mean.copy()
+    pos_vals[pos_vals <= 0] = -np.inf
     if np.isfinite(pos_vals).any():
-        pos_idx = int(np.argmax(pos_vals)); pos_val = float(delta_mean[pos_idx])
+        pos_idx = int(np.argmax(pos_vals))
+        pos_val = float(delta_mean[pos_idx])
     else:
         pos_idx, pos_val = None, None
 
-    neg_vals = delta_mean.copy(); neg_vals[neg_vals >= 0] = np.inf
+    neg_vals = delta_mean.copy()
+    neg_vals[neg_vals >= 0] = np.inf
     if np.isfinite(neg_vals).any():
-        neg_idx = int(np.argmin(neg_vals)); neg_val = float(delta_mean[neg_idx])
+        neg_idx = int(np.argmin(neg_vals))
+        neg_val = float(delta_mean[neg_idx])
     else:
         neg_idx, neg_val = None, None
 
@@ -177,26 +195,30 @@ for src_region in range(num_regions):
     if abs(abs_signed_val) > threshold / 10000:
         argmax_tgt = int(np.argmax(delta_mean))
         argmin_tgt = int(np.argmin(delta_mean))
-        kind = "兴奋性" if abs_signed_val > 0 else "抑制性" if abs_signed_val < 0 else "中性"
+        kind = "excitatory" if abs_signed_val > 0 else "inhibitory" if abs_signed_val < 0 else "neutral"
         print(
-            f"扰动源脑区 {src_region}: "
-            f"argmax 目标={argmax_tgt} (值={delta_mean[argmax_tgt]:.8f}), "
-            f"argmin 目标={argmin_tgt} (值={delta_mean[argmin_tgt]:.8f}), "
-            f"|.|最大 目标={abs_idx} (值={abs_signed_val:.8f}, 类型={kind})"
+            f"Source region {src_region}: "
+            f"argmax target={argmax_tgt} (value={delta_mean[argmax_tgt]:.8f}), "
+            f"argmin target={argmin_tgt} (value={delta_mean[argmin_tgt]:.8f}), "
+            f"largest |effect| target={abs_idx} (value={abs_signed_val:.8f}, type={kind})"
         )
 
-global_list = [(src, tgt, signed_val) for (src, tgt, signed_val, *_ ) in per_source_best]
+global_list = [(src, tgt, signed_val) for (src, tgt, signed_val, *_) in per_source_best]
 
-global_filtered_sorted = sorted([x for x in global_list if abs(x[2]) > threshold],
-                                key=lambda y: abs(y[2]), reverse=True)
+global_filtered_sorted = sorted(
+    [item for item in global_list if abs(item[2]) > threshold],
+    key=lambda item: abs(item[2]),
+    reverse=True,
+)
 
 if len(global_filtered_sorted) > 0:
-    print("\n基于‘每个源脑区最突出连接’（按绝对值降序，已过滤 |val| > {}）:\n".format(threshold))
+    print(
+        "\nGlobal connections based on the strongest link from each source region "
+        f"(sorted by absolute value, filtered by |value| > {threshold}):\n"
+    )
     for src, tgt, val in global_filtered_sorted:
-        kind = "兴奋性" if val > 0 else "抑制性" if val < 0 else "中性"
-        print(f"源脑区 {src} -> 目标脑区 {tgt} : {val:.8f} ({kind})")
-    print(f"\n共 {len(global_filtered_sorted)} 条符合条件的全局连接（无 TopN 限制）。")
+        kind = "excitatory" if val > 0 else "inhibitory" if val < 0 else "neutral"
+        print(f"Source region {src} -> target region {tgt}: {val:.8f} ({kind})")
+    print(f"\nFound {len(global_filtered_sorted)} global connections meeting the criterion, with no Top-N limit.")
 else:
-    print(f"\n未找到任何 |val| > {threshold} 的全局突出连接。")
-
-
+    print(f"\nNo global connections with |value| > {threshold} were found.")
