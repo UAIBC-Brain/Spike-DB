@@ -1,5 +1,7 @@
 import os
 import math
+import sys
+import types
 import numpy as np
 import scipy.io as sio
 import torch
@@ -11,6 +13,44 @@ from x_transformers import Encoder, Decoder
 from SNN_fMRI import SNN_Model 
 import copy
 
+try:
+    import importlib.metadata  # type: ignore
+except ModuleNotFoundError:
+    import importlib_metadata
+
+    sys.modules["importlib.metadata"] = importlib_metadata
+
+
+class _StatelessSurrogateLeaky(nn.Module):
+    def __init__(self, beta=0.9, threshold=0.5, slope=10.0):
+        super().__init__()
+        self.beta = beta
+        self.threshold = threshold
+        self.slope = slope
+
+    def forward(self, x, mem=None):
+        if mem is None:
+            mem = torch.zeros_like(x)
+
+        mem = self.beta * mem + x
+        surrogate = torch.sigmoid(self.slope * (mem - self.threshold))
+        hard_spike = (mem >= self.threshold).float()
+        spike = hard_spike.detach() - surrogate.detach() + surrogate
+        reset_mem = mem * (1.0 - hard_spike.detach())
+        return spike, reset_mem
+
+
+try:
+    import snntorch as snn
+except ModuleNotFoundError:
+    fallback_snntorch = types.ModuleType("snntorch")
+    fallback_snntorch.Leaky = _StatelessSurrogateLeaky
+    sys.modules.setdefault("snntorch", fallback_snntorch)
+    import snntorch as snn
+
+
+BETA = 0.9
+
 # -------------------------
 # Model components (adapted to fMRI tokens)
 # -------------------------
@@ -20,11 +60,13 @@ class Predictor(nn.Module):
         super().__init__()
 
         self.predictor = Decoder(dim=embed_dim, depth=depth, heads=num_heads)
+        self.predict_lif = snn.Leaky(beta=BETA)
 
     def forward(self, context_encoding, target_masks):
        
         x = torch.cat((context_encoding, target_masks), dim=1)   # [B, Lc+Lt, D]
         x = self.predictor(x)   
+        x, _ = self.predict_lif(x)
         l = x.shape[1]          
         return x[:, l - target_masks.shape[1]:, :]   
 
@@ -50,6 +92,11 @@ class IJEPA_fMRI_base(nn.Module):
 
         self.post_emb_norm = nn.LayerNorm(embed_dim) if post_emb_norm else nn.Identity()  
         self.norm = nn.LayerNorm(embed_dim)            
+        self.token_lif = snn.Leaky(beta=BETA)
+        self.teacher_lif = snn.Leaky(beta=BETA)
+        self.student_lif = snn.Leaky(beta=BETA)
+        self.mask_lif = snn.Leaky(beta=BETA)
+        self.output_lif = snn.Leaky(beta=BETA)
 
         self.teacher_encoder = Encoder(dim=embed_dim, heads=num_heads, depth=enc_depth, layer_dropout=self.layer_dropout)   
         self.student_encoder = copy.deepcopy(self.teacher_encoder)      
@@ -60,7 +107,13 @@ class IJEPA_fMRI_base(nn.Module):
     def get_teacher_full(self, x_emb):
        
         self.teacher_encoder = self.teacher_encoder.eval()    
-        return self.norm(self.teacher_encoder(x_emb))        
+        teacher_full = self.norm(self.teacher_encoder(x_emb))
+        teacher_full, _ = self.teacher_lif(teacher_full)
+        return teacher_full       
+
+    @staticmethod
+    def compute_firing_rate(spike_seq):
+        return spike_seq.float().mean(dim=-1)
 
     def forward(self, x, M=None, exhaustive=True):
         
@@ -74,16 +127,21 @@ class IJEPA_fMRI_base(nn.Module):
         x_emb = x_emb + self.pos_embedding   # [B, R, D]
 
         x_emb = self.post_emb_norm(x_emb)
+        x_emb, _ = self.token_lif(x_emb)
 
         if self.mode == 'test':
             # return student encoder full embeddings
-            return self.student_encoder(x_emb)
+            student_test = self.student_encoder(x_emb)
+            student_test = self.norm(student_test)
+            student_test, _ = self.student_lif(student_test)
+            return student_test
 
         with torch.no_grad():
             teacher_full = self.get_teacher_full(x_emb)  # [B, R, D]
 
         student_full = self.student_encoder(x_emb)     # [B, R, D]
         student_full = self.norm(student_full)
+        student_full, _ = self.student_lif(student_full)
 
 
         if exhaustive:
@@ -104,15 +162,37 @@ class IJEPA_fMRI_base(nn.Module):
             target_mask = self.mask_token.repeat(B, 1, 1)        # [B,1,D]
             target_pos = self.pos_embedding[:, t:t+1, :]         # [1,1,D]
             target_mask = target_mask + target_pos              # [B,1,D]
+            target_mask, _ = self.mask_lif(target_mask)
 
             pred = self.predictor(context_encoding, target_mask) # [B,1,D]
             preds.append(pred)
 
         pred_targets = torch.cat(preds, dim=1)    # [B, K, D]
-        pred_seq = self.decoder_to_seq(pred_targets)  # [B, K, seq_len]
         teacher_targets = torch.cat(teachers, dim=1)  # [B, K, D]
-        teacher_seq = self.decoder_to_seq(teacher_targets)  # [B, K, 240]
-        return pred_seq, teacher_seq
+        pred_seq_current = self.decoder_to_seq(pred_targets)  # [B, K, seq_len]
+        teacher_seq_current = self.decoder_to_seq(teacher_targets)  # [B, K, seq_len]
+
+        pred_spike_seq, _ = self.output_lif(pred_seq_current)
+        teacher_spike_seq, _ = self.output_lif(teacher_seq_current)
+
+        target_seq = x[:, target_indices, :]
+        pred_rate = self.compute_firing_rate(pred_spike_seq)
+        teacher_rate = self.compute_firing_rate(teacher_spike_seq)
+        target_rate = self.compute_firing_rate(target_seq)
+
+        return {
+            "pred_seq": pred_spike_seq,
+            "teacher_seq": teacher_spike_seq,
+            "target_seq": target_seq,
+            "pred_rate": pred_rate,
+            "teacher_rate": teacher_rate,
+            "target_rate": target_rate,
+            "target_indices": target_indices,
+        }
+
+
+def firing_rate_mse_loss(pred_rate, target_rate):
+    return torch.mean((pred_rate - target_rate) ** 2)
 
 
 class IJEPA_fMRI(pl.LightningModule):
@@ -146,7 +226,7 @@ class IJEPA_fMRI(pl.LightningModule):
         self.exhaustive = exhaustive
         self.num_regions = num_regions
 
-        self.criterion = nn.MSELoss()
+        self.criterion = firing_rate_mse_loss
 
         self.m = m
         self.m_start_end = m_start_end
@@ -170,9 +250,10 @@ class IJEPA_fMRI(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x = batch  # [B, R, T]
-        pred, teacher = self(x)  # [B, K, D]
-        loss = self.criterion(pred, teacher)   
+        outputs = self(x)
+        loss = self.criterion(outputs["pred_rate"], outputs["target_rate"])
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log('train_rate_mse', loss, prog_bar=False, on_step=True, on_epoch=True)
         return loss
 
     def on_validation_epoch_start(self):
@@ -183,22 +264,24 @@ class IJEPA_fMRI(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x = batch
-        pred, teacher = self(x)  # shapes [B, K, D]
-        loss = self.criterion(pred, teacher)
+        outputs = self(x)
+        pred_rate = outputs["pred_rate"]
+        target_rate = outputs["target_rate"]
+        loss = self.criterion(pred_rate, target_rate)
         # log batch loss as usual
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        pred_cpu = pred.detach().cpu()
-        teacher_cpu = teacher.detach().cpu()
+        pred_cpu = pred_rate.detach().cpu()
+        target_cpu = target_rate.detach().cpu()
 
-        diff = pred_cpu - teacher_cpu
+        diff = pred_cpu - target_cpu
         sq_err = (diff ** 2).sum().item()   
         n_elems = pred_cpu.numel()         
 
         self.val_sum_sq_error += sq_err
         self.val_n_elements += n_elems
-        self.val_sum_targets += teacher_cpu.sum().item()
-        self.val_sum_targets_sq += (teacher_cpu ** 2).sum().item()
+        self.val_sum_targets += target_cpu.sum().item()
+        self.val_sum_targets_sq += (target_cpu ** 2).sum().item()
 
         return loss
 
