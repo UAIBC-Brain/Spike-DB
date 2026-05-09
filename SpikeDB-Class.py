@@ -233,8 +233,8 @@ class FMRIDataModule(pl.LightningDataModule):
 
 
 if __name__ == "__main__":
-    data_path = r"G:\XXX\XXX.mat"
-    label_path = r"G:\XXX\XXX.mat"
+    data_path = r"G:\file\test.mat"
+    label_path = r"G:\file\test.mat"
 
     runtime_device = "cuda" if torch.cuda.is_available() else "cpu"
     dm = FMRIDataModule(data_path, label_path, batch_size=2, num_workers=2, shuffle=True, zscore=False, device=runtime_device)
