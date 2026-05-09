@@ -413,7 +413,7 @@ class FMRIDataModule(pl.LightningDataModule):
 
 if __name__ == "__main__":
   
-    dataset_path = r'G:\XXX\XXX.mat'
+    dataset_path = r'G:\file\test.mat'
 
     dm = FMRIDataModule(dataset_path=dataset_path, batch_size=8, num_workers=2, shuffle=True)  
 
