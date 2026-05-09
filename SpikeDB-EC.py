@@ -9,7 +9,7 @@ from SpikeDB import IJEPA_fMRI
 
 ckpt_path = r"G:\file\test.ckpt"
 data_path = r"G:\file\test.mat"
-sample_idx = 50
+sample_idx = 60
 exclude_self = True
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
